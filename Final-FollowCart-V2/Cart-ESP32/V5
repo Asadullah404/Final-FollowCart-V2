@@ -1,0 +1,543 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <IRremote.h>
+#include <BluetoothSerial.h>
+#include <HX711.h>
+
+// Bluetooth Setup
+BluetoothSerial SerialBT;
+
+// Sensor Pins
+#define TRIG_LEFT 5
+#define ECHO_LEFT 18
+#define TRIG_CENTER 19
+#define ECHO_CENTER 21
+#define TRIG_RIGHT 22
+#define ECHO_RIGHT 23
+#define IR_COLLISION_PIN 27
+#define IR_RECEIVE_PIN 26
+#define BUZZER_PIN 25
+
+// HX711 Load Cell Pins
+#define LOADCELL_DOUT_PIN 32
+#define LOADCELL_SCK_PIN 33
+HX711 scale;
+float currentWeight = 0;
+bool overloaded = false;
+const float WEIGHT_THRESHOLD = 1.0;
+
+// IR Configuration
+const unsigned int IR_EXPECTED_ADDRESS = 0x10AB;
+unsigned long lastIRSignalTime = 0;
+const unsigned long IR_TIMEOUT = 5000;
+
+// Operation Modes
+#define MODE_AUTONOMOUS 0
+#define MODE_MANUAL 1
+#define MODE_OPENCV 2
+#define MODE_HYBRID 3
+
+// System States
+bool irSignalDetected = false;
+bool powerOn = true;
+int operationMode = MODE_AUTONOMOUS;
+bool cartPickedUp = false;
+bool buzzerDisabled = false;
+unsigned long pickupDetectionTime = 0;
+const unsigned long PICKUP_BUZZER_TIMEOUT = 3000;
+
+// Motor Pins & Settings
+#define MOTOR_LEFT_IN1 13
+#define MOTOR_LEFT_IN2 14
+#define MOTOR_LEFT_PWM 12
+#define MOTOR_RIGHT_IN3 16
+#define MOTOR_RIGHT_IN4 17
+#define MOTOR_RIGHT_PWM 15
+#define DEFAULT_FWD_SPEED 153
+#define DEFAULT_TURN_SPEED 120
+#define HYBRID_TURN_SPEED 80
+int forwardSpeed = DEFAULT_FWD_SPEED;
+int turnSpeed = DEFAULT_TURN_SPEED;
+int currentSpeed = DEFAULT_FWD_SPEED;
+int minSpeedLevel = 3;
+
+// Web Server Configuration
+const char* ssid = "CartNetwork";
+const char* password = "cartpassword";
+const char* bluetoothName = "ESP32_Cart";
+WebServer server(80);
+IPAddress local_IP(192, 168, 10, 1);
+IPAddress gateway(192, 168, 10, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+// System Variables
+long prevLeft = 0, prevCenter = 0, prevRight = 0;
+String lastAction = "Idle";
+unsigned long lastBuzzToggle = 0;
+bool buzzerState = false;
+bool buzzerActive = false;
+
+// Function Prototypes
+void handleBluetoothCommands();
+void moveBackward(int speedLeft, int speedRight);
+void emergencyStop();
+void hybridNavigation(char command);
+
+long getSequentialDistance(int trigPin, int echoPin) {
+  digitalWrite(TRIG_LEFT, LOW);
+  digitalWrite(TRIG_CENTER, LOW);
+  digitalWrite(TRIG_RIGHT, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  if(duration <= 0) return -1;
+  return duration * 0.034 / 2;
+}
+
+void moveForward(int speedLeft, int speedRight) {
+  if (overloaded) return;
+  analogWrite(MOTOR_LEFT_PWM, speedLeft);
+  digitalWrite(MOTOR_LEFT_IN1, HIGH);
+  digitalWrite(MOTOR_LEFT_IN2, LOW);
+  analogWrite(MOTOR_RIGHT_PWM, speedRight);
+  digitalWrite(MOTOR_RIGHT_IN3, HIGH);
+  digitalWrite(MOTOR_RIGHT_IN4, LOW);
+}
+
+void moveBackward(int speedLeft, int speedRight) {
+  if (overloaded) return;
+  analogWrite(MOTOR_LEFT_PWM, speedLeft);
+  digitalWrite(MOTOR_LEFT_IN1, LOW);
+  digitalWrite(MOTOR_LEFT_IN2, HIGH);
+  analogWrite(MOTOR_RIGHT_PWM, speedRight);
+  digitalWrite(MOTOR_RIGHT_IN3, LOW);
+  digitalWrite(MOTOR_RIGHT_IN4, HIGH);
+}
+
+void turnLeft() {
+  if (overloaded) return;
+  analogWrite(MOTOR_LEFT_PWM, turnSpeed);
+  digitalWrite(MOTOR_LEFT_IN1, LOW);
+  digitalWrite(MOTOR_LEFT_IN2, HIGH);
+  analogWrite(MOTOR_RIGHT_PWM, forwardSpeed);
+  digitalWrite(MOTOR_RIGHT_IN3, HIGH);
+  digitalWrite(MOTOR_RIGHT_IN4, LOW);
+}
+
+void turnRight() {
+  if (overloaded) return;
+  analogWrite(MOTOR_LEFT_PWM, forwardSpeed);
+  digitalWrite(MOTOR_LEFT_IN1, HIGH);
+  digitalWrite(MOTOR_LEFT_IN2, LOW);
+  analogWrite(MOTOR_RIGHT_PWM, turnSpeed);
+  digitalWrite(MOTOR_RIGHT_IN3, LOW);
+  digitalWrite(MOTOR_RIGHT_IN4, HIGH);
+}
+
+void stopMotors() {
+  analogWrite(MOTOR_LEFT_PWM, 0);
+  analogWrite(MOTOR_RIGHT_PWM, 0);
+  digitalWrite(MOTOR_LEFT_IN1, LOW);
+  digitalWrite(MOTOR_LEFT_IN2, LOW);
+  digitalWrite(MOTOR_RIGHT_IN3, LOW);
+  digitalWrite(MOTOR_RIGHT_IN4, LOW);
+}
+
+void emergencyStop() {
+  stopMotors();
+  currentSpeed = 0;
+  lastAction = "Emergency Stop";
+}
+
+void hybridNavigation(char command) {
+  long distanceLeft = getSequentialDistance(TRIG_LEFT, ECHO_LEFT);
+  delay(10);
+  long distanceCenter = getSequentialDistance(TRIG_CENTER, ECHO_CENTER);
+  delay(10);
+  long distanceRight = getSequentialDistance(TRIG_RIGHT, ECHO_RIGHT);
+
+  if(distanceLeft <= 0) distanceLeft = prevLeft;
+  if(distanceCenter <= 0) distanceCenter = prevCenter;
+  if(distanceRight <= 0) distanceRight = prevRight;
+
+  prevLeft = distanceLeft;
+  prevCenter = distanceCenter;
+  prevRight = distanceRight;
+
+  bool obstacleLeft = distanceLeft <= 20;
+  bool obstacleCenter = distanceCenter <= 20;
+  bool obstacleRight = distanceRight <= 20;
+
+  if (obstacleLeft && obstacleCenter && obstacleRight) {
+    stopMotors();
+    lastAction = "Obstacle All Directions";
+    buzzerActive = !buzzerDisabled;
+    return;
+  }
+
+  switch(command) {
+    case 'F':
+      if (obstacleCenter) {
+        if (!obstacleLeft && obstacleRight) {
+          analogWrite(MOTOR_LEFT_PWM, HYBRID_TURN_SPEED);
+          digitalWrite(MOTOR_LEFT_IN1, LOW);
+          digitalWrite(MOTOR_LEFT_IN2, HIGH);
+          analogWrite(MOTOR_RIGHT_PWM, currentSpeed);
+          digitalWrite(MOTOR_RIGHT_IN3, HIGH);
+          digitalWrite(MOTOR_RIGHT_IN4, LOW);
+          lastAction = "Forward (Adjusted Left)";
+        } 
+        else if (obstacleLeft && !obstacleRight) {
+          analogWrite(MOTOR_LEFT_PWM, currentSpeed);
+          digitalWrite(MOTOR_LEFT_IN1, HIGH);
+          digitalWrite(MOTOR_LEFT_IN2, LOW);
+          analogWrite(MOTOR_RIGHT_PWM, HYBRID_TURN_SPEED);
+          digitalWrite(MOTOR_RIGHT_IN3, LOW);
+          digitalWrite(MOTOR_RIGHT_IN4, HIGH);
+          lastAction = "Forward (Adjusted Right)";
+        } 
+        else if (!obstacleLeft && !obstacleRight) {
+          analogWrite(MOTOR_LEFT_PWM, currentSpeed);
+          digitalWrite(MOTOR_LEFT_IN1, HIGH);
+          digitalWrite(MOTOR_LEFT_IN2, LOW);
+          analogWrite(MOTOR_RIGHT_PWM, HYBRID_TURN_SPEED);
+          digitalWrite(MOTOR_RIGHT_IN3, LOW);
+          digitalWrite(MOTOR_RIGHT_IN4, HIGH);
+          lastAction = "Forward (Adjusted Right)";
+        } 
+        else {
+          stopMotors();
+          lastAction = "Cannot Move Forward";
+        }
+      } 
+      else {
+        moveForward(currentSpeed, currentSpeed);
+        lastAction = "Forward";
+      }
+      break;
+
+    case 'B':
+      moveBackward(currentSpeed, currentSpeed);
+      lastAction = "Backward";
+      break;
+
+    case 'L':
+      if (obstacleLeft) {
+        if (!obstacleRight) {
+          turnRight();
+          lastAction = "Right (Left Blocked)";
+        } 
+        else {
+          stopMotors();
+          lastAction = "Cannot Turn Left";
+        }
+      } 
+      else {
+        turnLeft();
+        lastAction = "Left";
+      }
+      break;
+
+    case 'R':
+      if (obstacleRight) {
+        if (!obstacleLeft) {
+          turnLeft();
+          lastAction = "Left (Right Blocked)";
+        } 
+        else {
+          stopMotors();
+          lastAction = "Cannot Turn Right";
+        }
+      } 
+      else {
+        turnRight();
+        lastAction = "Right";
+      }
+      break;
+
+    case 'S':
+      stopMotors();
+      lastAction = "Stopped";
+      break;
+
+    case 'D':
+      emergencyStop();
+      lastAction = "Emergency Stop";
+      break;
+
+    default:
+      break;
+  }
+}
+
+void handleRoot() {
+  String page = "<!DOCTYPE html><html><head><title>FollowCart: Smart Moving Companion</title>";
+  page += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  page += "<style>";
+  page += "body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; }";
+  page += ".container { max-width: 900px; margin: 0 auto; background: white; border-radius: 10px; padding: 20px; box-shadow: 0 0 15px rgba(0,0,0,0.1); }";
+  page += "header { text-align: center; margin-bottom: 20px; padding-bottom: 20px; border-bottom: 1px solid #eee; }";
+  page += "h1 { color: #2c3e50; margin-bottom: 5px; }";
+  page += ".subtitle { color: #7f8c8d; font-size: 1.1em; margin-bottom: 15px; }";
+  page += ".university { background-color: #3498db; color: white; padding: 5px 10px; border-radius: 5px; display: inline-block; margin-bottom: 15px; font-weight: bold; }";
+  page += ".status-box { background: #f9f9f9; border-radius: 8px; padding: 15px; margin-bottom: 20px; }";
+  page += ".grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-bottom: 20px; }";
+  page += "button { width: 100%; padding: 12px; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; transition: all 0.3s; margin: 5px 0; }";
+  page += "input[type='range'] { width: 100%; margin: 10px 0; }";
+  page += "form button { margin-top: 10px; }";
+  page += ".active { background-color: #2ecc71; color: white; }";
+  page += ".inactive { background-color: #ecf0f1; color: #7f8c8d; }";
+  page += ".warning { background-color: #e67e22; color: white; }";
+  page += ".danger { background-color: #e74c3c; color: white; }";
+  page += "table { width: 100%; border-collapse: collapse; margin: 15px 0; }";
+  page += "th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }";
+  page += "th { background-color: #f2f2f2; }";
+  page += ".alert { background-color: #ffebee; padding: 10px; border-radius: 4px; margin: 10px 0; }";
+  page += ".team-section { margin-top: 30px; background-color: #f8f9fa; padding: 15px; border-radius: 8px; }";
+  page += ".team-title { color: #2c3e50; border-bottom: 1px solid #ddd; padding-bottom: 10px; }";
+  page += ".team-member { margin: 5px 0; padding: 8px; background-color: white; border-radius: 5px; }";
+  page += "@media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }";
+  page += "</style>";
+  
+  // AJAX Update Script
+  page += "<script>";
+  page += "function updateSensorData() {";
+  page += "  fetch('/sensorData').then(response => response.json()).then(data => {";
+  page += "    document.getElementById('leftDist').innerText = data.left;";
+  page += "    document.getElementById('centerDist').innerText = data.center;";
+  page += "    document.getElementById('rightDist').innerText = data.right;";
+  page += "    document.getElementById('weightValue').innerText = data.weight;";
+  page += "    document.getElementById('actionText').innerText = data.action;";
+  page += "    document.getElementById('modeText').innerText = data.mode;";
+  page += "    document.getElementById('stateText').innerText = data.state;";
+  page += "    document.getElementById('buzzerText').innerText = data.buzzer;";
+  page += "    document.getElementById('powerText').innerText = data.power;";
+  page += "  });";
+  page += "}";
+  page += "setInterval(updateSensorData, 1000);";
+  page += "</script>";
+  
+  page += "</head><body>";
+  page += "<div class='container'>";
+  page += "<header>";
+  page += "<h1>FollowCart: Smart Moving Companion</h1>";
+  page += "<div class='university'>Dawood University of Engineering & Technology</div>";
+  page += "</header>";
+
+  page += "<div class='status-box'>";
+  page += "<h2>Current Status</h2>";
+  page += "<p><strong>Action:</strong> <span id='actionText'>" + lastAction + "</span></p>";
+  page += "<p><strong>Mode:</strong> <span id='modeText'>";
+  switch(operationMode) {
+    case MODE_AUTONOMOUS: page += "Autonomous"; break;
+    case MODE_MANUAL: page += "Manual (Bluetooth)"; break;
+    case MODE_OPENCV: page += "OpenCV based"; break;
+    case MODE_HYBRID: page += "OpenCV + Ultrasonic Hybrid"; break;
+  }
+  page += "</span></p>";
+
+  if(cartPickedUp) {
+    page += "<div class='alert'><strong>⚠ Cart State:</strong> <span id='stateText'>PICKED UP!</span></div>";
+  } else {
+    page += "<p><strong>Cart State:</strong> <span id='stateText'>On Ground</span></p>";
+  }
+
+  page += "<p><strong>Buzzer:</strong> <span id='buzzerText'>" + String(buzzerDisabled ? "🔕 DISABLED" : "🔔 ENABLED") + "</span></p>";
+  page += "<p><strong>Power:</strong> <span id='powerText'>" + String(powerOn ? "⚡ ON" : "⛔ OFF") + "</span></p>";
+  page += "</div>";
+
+  page += "<div class='status-box'>";
+  page += "<h2>Sensor Readings</h2>";
+  page += "<table>";
+  page += "<tr><th>Sensor</th><th>Distance (cm)</th></tr>";
+  page += "<tr><td>Left</td><td id='leftDist'>" + String(prevLeft) + "</td></tr>";
+  page += "<tr><td>Center</td><td id='centerDist'>" + String(prevCenter) + "</td></tr>";
+  page += "<tr><td>Right</td><td id='rightDist'>" + String(prevRight) + "</td></tr>";
+  page += "<tr><td>Weight</td><td id='weightValue'>" + String(currentWeight, 1) + " kg</td></tr>";
+  page += "</table>";
+
+  if (overloaded) {
+    page += "<div class='alert'><strong>⚠ OVERLOAD:</strong> Weight exceeds 1kg!</div>";
+  }
+  page += "</div>";
+
+  page += "<div class='grid'>";
+  page += "<div class='status-box'>";
+  page += "<h2>Power Control</h2>";
+  page += "<a href='/power/on'><button class='" + String(powerOn ? "active" : "inactive") + "'>Turn ON</button></a>";
+  page += "<a href='/power/off'><button class='" + String(!powerOn ? "danger" : "inactive") + "'>Turn OFF</button></a>";
+  page += "</div>";
+
+  page += "<div class='status-box'>";
+  page += "<h2>Operation Mode</h2>";
+  page += "<a href='/mode/auto'><button class='" + String(operationMode == MODE_AUTONOMOUS ? "active" : "inactive") + "'>Autonomous</button></a>";
+  page += "<a href='/mode/manual'><button class='" + String(operationMode == MODE_MANUAL ? "active" : "inactive") + "'>Manual</button></a>";
+  page += "<a href='/mode/opencv'><button class='" + String(operationMode == MODE_OPENCV ? "active" : "inactive") + "'>OpenCV</button></a>";
+  page += "<a href='/mode/hybrid'><button class='" + String(operationMode == MODE_HYBRID ? "active" : "inactive") + "'>Hybrid Mode</button></a>";
+  page += "</div>";
+
+  page += "<div class='status-box'>";
+  page += "<h2>Speed Control</h2>";
+  page += "<form action='/setSpeed' method='POST'>";
+  page += "<p>Forward Speed: <span id='fwdValue'>" + String(forwardSpeed) + "</span></p>";
+  page += "<input type='range' name='fwdSpeed' min='50' max='255' value='" + String(forwardSpeed) + "' oninput='document.getElementById(\"fwdValue\").innerHTML=this.value'>";
+  page += "<p>Turn Speed: <span id='turnValue'>" + String(turnSpeed) + "</span></p>";
+  page += "<input type='range' name='turnSpeed' min='30' max='200' value='" + String(turnSpeed) + "' oninput='document.getElementById(\"turnValue\").innerHTML=this.value'>";
+  page += "<p>Minimum Speed Level (1-10): <span id='minSpeedValue'>" + String(minSpeedLevel) + "</span></p>";
+  page += "<input type='range' name='minSpeedLevel' min='1' max='10' value='" + String(minSpeedLevel) + "' oninput='document.getElementById(\"minSpeedValue\").innerHTML=this.value'>";
+  page += "<button type='submit'>Update Speeds</button>";
+  page += "</form>";
+  page += "</div>";
+
+  page += "<div class='status-box'>";
+  page += "<h2>Buzzer Control</h2>";
+  page += "<a href='/buzzer/on'><button class='" + String(!buzzerDisabled ? "active" : "inactive") + "'>Enable Buzzer</button></a>";
+  page += "<a href='/buzzer/off'><button class='" + String(buzzerDisabled ? "warning" : "inactive") + "'>Disable Buzzer</button></a>";
+  page += "</div>";
+  page += "</div>";
+
+  if(operationMode == MODE_MANUAL || operationMode == MODE_OPENCV || operationMode == MODE_HYBRID) {
+    page += "<div class='status-box'>";
+    page += "<h2>Bluetooth Control</h2>";
+    page += "<p>Device Name: <strong>" + String(bluetoothName) + "</strong></p>";
+    page += "<p>Available Commands:</p>";
+    page += "<ul>";
+    page += "<li>F - Forward</li>";
+    page += "<li>B - Backward</li>";
+    page += "<li>L - Left</li>";
+    page += "<li>R - Right</li>";
+    page += "<li>S - Stop</li>";
+    page += "<li>D - Emergency Stop</li>";
+    page += "<li>0-9 - Speed (relative to min speed)</li>";
+    page += "<li>q - Full Speed (100%)</li>";
+    page += "</ul>";
+    if (operationMode == MODE_HYBRID) {
+      page += "<p><strong>Hybrid Mode:</strong> Commands adjust for obstacles</p>";
+    }
+    page += "<p><strong>Current Min Speed Level:</strong> " + String(minSpeedLevel) + "</p>";
+    page += "</div>";
+  }
+
+  page += "<div class='team-section'>";
+  page += "<h3 class='team-title'>Development Team</h3>";
+  page += "<div class='team-member'>M. Asadullah Sohail (M-21/F-BSCS-04)</div>";
+  page += "<div class='team-member'>Muhammad Daniyal (M-21/F-BSCS-26)</div>";
+  page += "<div class='team-member'>Zulfiqar Ali (M-21/F-BSCS-40)</div>";
+  page += "<div class='team-member'>Hafiz Sameer Khan (M-21/F-BSCS-99)</div>";
+  page += "</div>";
+
+  page += "</div></body></html>";
+  server.send(200, "text/html", page);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize Bluetooth
+  SerialBT.begin(bluetoothName);
+  Serial.println("Bluetooth Started! Name: " + String(bluetoothName));
+
+  // Configure Access Point
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  WiFi.softAP(ssid, password);
+  Serial.println("Access Point Started");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Initialize HX711
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale(-500);
+  scale.tare();
+
+  // Server endpoints
+  server.on("/", handleRoot);
+  server.on("/power/on", []() {
+    powerOn = true;
+    server.send(200, "text/plain", "Cart Powered ON");
+  });
+  server.on("/power/off", []() {
+    powerOn = false;
+    stopMotors();
+    server.send(200, "text/plain", "Cart Powered OFF");
+  });
+  server.on("/mode/auto", []() {
+    operationMode = MODE_AUTONOMOUS;
+    stopMotors();
+    server.send(200, "text/plain", "Autonomous Mode Activated");
+  });
+  server.on("/mode/manual", []() {
+    operationMode = MODE_MANUAL;
+    stopMotors();
+    server.send(200, "text/plain", "Manual Mode Activated");
+  });
+  server.on("/mode/opencv", []() {
+    operationMode = MODE_OPENCV;
+    stopMotors();
+    server.send(200, "text/plain", "OpenCV Mode Activated");
+  });
+  server.on("/mode/hybrid", []() {
+    operationMode = MODE_HYBRID;
+    stopMotors();
+    server.send(200, "text/plain", "Hybrid Mode Activated");
+  });
+  server.on("/buzzer/on", []() {
+    buzzerDisabled = false;
+    server.send(200, "text/plain", "Buzzer Enabled");
+  });
+  server.on("/buzzer/off", []() {
+    buzzerDisabled = true;
+    digitalWrite(BUZZER_PIN, LOW);
+    server.send(200, "text/plain", "Buzzer Disabled");
+  });
+  server.on("/setSpeed", HTTP_POST, []() {
+    if (server.hasArg("fwdSpeed")) {
+      forwardSpeed = server.arg("fwdSpeed").toInt();
+      currentSpeed = forwardSpeed;
+    }
+    if (server.hasArg("turnSpeed")) {
+      turnSpeed = server.arg("turnSpeed").toInt();
+    }
+    if (server.hasArg("minSpeedLevel")) {
+      minSpeedLevel = server.arg("minSpeedLevel").toInt();
+      if (minSpeedLevel < 1) minSpeedLevel = 1;
+      if (minSpeedLevel > 10) minSpeedLevel = 10;
+    }
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+  
+  // Add sensor data endpoint
+  server.on("/sensorData", []() {
+    String json = "{";
+    json += "\"left\":" + String(prevLeft) + ",";
+    json += "\"center\":" + String(prevCenter) + ",";
+    json += "\"right\":" + String(prevRight) + ",";
+    json += "\"weight\":" + String(currentWeight, 1) + ",";
+    json += "\"action\":\"" + lastAction + "\",";
+    
+    String modeStr;
+    switch(operationMode) {
+      case MODE_AUTONOMOUS: modeStr = "Autonomous"; break;
+      case MODE_MANUAL: modeStr = "Manual (Bluetooth)"; break;
+      case MODE_OPENCV: modeStr = "OpenCV based"; break;
+      case MODE_HYBRID: modeStr = "OpenCV + Ultrasonic Hybrid"; break;
+    }
+    json += "\"mode\":\"" + modeStr + "\",";
+    
+    json += "\"state\":\"" + String(cartPickedUp ? "PICKED UP!" : "On Ground") + "\",";
+    json += "\"buzzer\":\"" + String(buzzerDisabled ? "🔕 DISABLED" : "🔔 ENABLED") + "\",";
+    json += "\"power\":\"" + String(powerOn ? "⚡ ON" : "⛔ OFF") + "\"";
+    json += "}";
+    
+    server.send(200, "application/json", json);
+  });
+
+  server.begin();
+
+  // Pin setups
+  pinMode(IR_COLLISION_PIN, INPUT);
+  IrRece
